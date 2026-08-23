@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.request
 
-BASE_URL = "https://epgshare01.online/epgshare01/{}.xml.gz"
+BASE_URL = "https://epgshare01.online/epgshare01/epg_ripper_{}.xml.gz"
 OUT_DIR = "public"
 MAX_WORKERS = 8
 RETRIES = 2
