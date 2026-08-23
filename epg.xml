@@ -1,0 +1,18 @@
+<?xml version='1.0' encoding='utf-8'?>
+<tv generator-info-name="Mainstreams EPG Generator" generator-info-url="https://github.com/iptv-org/epg">
+  <channel id="HBO.us">
+    <display-name>HBO.us</display-name>
+  </channel>
+  <channel id="CNN.us">
+    <display-name>CNN.us</display-name>
+  </channel>
+  <channel id="ESPN.us">
+    <display-name>ESPN.us</display-name>
+  </channel>
+  <channel id="AMC.us">
+    <display-name>AMC.us</display-name>
+  </channel>
+  <channel id="Discovery.us">
+    <display-name>Discovery.us</display-name>
+  </channel>
+</tv>
