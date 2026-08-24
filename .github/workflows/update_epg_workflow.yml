@@ -2,7 +2,10 @@ name: Update EPG
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Runs daily at midnight UTC
+    # Every 6 hours. The trimmed guide's window is evaluated at build time,
+    # so rebuilding often is what lets WINDOW_HOURS stay small in fetch_epg.py
+    # without the file going stale between runs.
+    - cron: '0 */6 * * *'
   workflow_dispatch: # Allows you to run it manually from the Actions tab
 
 permissions:
