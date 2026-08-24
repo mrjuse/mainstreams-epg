@@ -22,9 +22,28 @@ https://mrjuse.github.io/mainstreams-epg/all_48h.xml.gz
 ```
 
 Every channel from every region, but only programmes airing in a rolling
-−6h/+48h window. That trims the programme count by roughly 85% versus the
-full merge while keeping the identical channel list, which is what makes it
-realistic to parse on a set-top box or TV stick.
+−6h/+48h window, keeping the identical channel list.
+
+Be aware of the actual scale here: the upstream sources only carry about four
+days of listings, so a 48-hour window still retains **roughly 57%** of the
+programmes — about 992,000 of them, 74.7MB gzipped. That is a real
+improvement over the full merge but it is *not* a small file. If the app
+allocates an object per programme it will still exhaust a typical Android
+heap. Shrinking `WINDOW_HOURS` helps roughly linearly (measured against the
+current data):
+
+| Window        | Programmes | Size   |
+|---------------|-----------:|-------:|
+| −6h / +48h    |    992,000 | 74.7MB |
+| −6h / +24h    |    551,000 | 41.5MB |
+| −3h / +12h    |    276,000 | 20.8MB |
+| −2h / +6h     |    147,000 | 11.1MB |
+
+The far larger win is filtering by channel: this guide carries 19,134
+channels, while a typical playlist uses a few hundred. Discarding programmes
+whose `channel` is not in the loaded playlist — during parsing, before
+allocating — cuts the working set by one to two orders of magnitude and is
+the change most worth making on the app side.
 
 **A playlist covering one country:** use that country's own file, e.g.
 `https://mrjuse.github.io/mainstreams-epg/north_america/US2.xml.gz`. This is
