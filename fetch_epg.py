@@ -5,11 +5,19 @@ curated set of countries/sources across North America, the Caribbean, South
 America, Europe (including Spain), Africa, and Asia, and lays them out as
 static files for GitHub Pages.
 
-Per-country files stay small, so a player that only needs one country can
-download just that file. For players/apps that only support a single EPG
-URL and mix channels from many regions in one playlist, this also builds a
-combined `all.xml.gz` merging every successfully-fetched source into one
-XMLTV file.
+Three kinds of output:
+
+* ``public/<region>/<code>.xml.gz`` - one small file per country/source.
+  Best choice when a playlist only covers a single country.
+* ``public/all.xml.gz``             - every source merged into one XMLTV file.
+  For players that accept only one EPG URL, but very large.
+* ``public/all_48h.xml.gz``        - the same merge trimmed to programmes
+  airing in a rolling window (see WINDOW_HOURS / LOOKBACK_HOURS). Same
+  channel list, a small fraction of the programmes - this is the one to use
+  on memory-constrained devices such as Android TV sticks.
+
+The merge streams element-by-element straight into the gzip writers, so peak
+memory stays low no matter how large the combined guide gets.
 """
 
 import concurrent.futures
@@ -21,12 +29,19 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 
 BASE_URL = "https://epgshare01.online/epgshare01/epg_ripper_{}.xml.gz"
 OUT_DIR = "public"
 MAX_WORKERS = 8
 RETRIES = 2
 TIMEOUT = 60
+
+# Rolling window kept in the trimmed combined guide. The workflow regenerates
+# daily, so at worst (just before the next run) the trimmed file still holds
+# WINDOW_HOURS - 24 hours of forward listings.
+WINDOW_HOURS = 48
+LOOKBACK_HOURS = 6  # keeps just-finished programmes, absorbs device clock skew
 
 REGIONS = {
     "north_america": {
@@ -163,66 +178,148 @@ def fetch_one(region, code, name):
     return region, code, name, 0, False, str(last_error)
 
 
+def parse_xmltv_time(value):
+    """Parse an XMLTV timestamp into an aware UTC datetime.
+
+    Accepts the usual ``YYYYMMDDHHMMSS +0100`` form, a bare
+    ``YYYYMMDDHHMMSS`` (treated as UTC), and shorter stamps such as
+    ``YYYYMMDDHHMM`` which are zero-padded. Returns None if unparseable.
+    """
+    if not value:
+        return None
+    parts = value.strip().split()
+    if not parts:
+        return None
+    stamp = parts[0]
+    offset = parts[1] if len(parts) > 1 else None
+
+    if len(stamp) < 14:
+        stamp = stamp.ljust(14, "0")
+    try:
+        dt = datetime.strptime(stamp[:14], "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+
+    if offset and len(offset) >= 5 and offset[0] in "+-":
+        try:
+            sign = 1 if offset[0] == "+" else -1
+            delta = timedelta(hours=int(offset[1:3]), minutes=int(offset[3:5]))
+            dt = dt - sign * delta  # local time -> UTC
+        except ValueError:
+            pass
+
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def in_window(prog, win_start, win_end):
+    """True if a <programme> overlaps the rolling window.
+
+    Unparseable/absent start times are excluded - a programme with no usable
+    time can't drive a 'now playing' banner anyway. Missing stop falls back to
+    start so such entries are still judged on when they begin.
+    """
+    start = parse_xmltv_time(prog.get("start"))
+    if start is None:
+        return False
+    stop = parse_xmltv_time(prog.get("stop")) or start
+    return stop > win_start and start < win_end
+
+
 def merge_all():
-    """Merge every successfully-fetched per-country file into one combined
-    XMLTV file, for players/apps that only support a single EPG URL and mix
-    channels from multiple regions in one playlist."""
-    root = ET.Element(
-        "tv",
-        {
-            "generator-info-name": "mainstreams-epg",
-            "generator-info-url": "https://github.com/mrjuse/mainstreams-epg",
-        },
+    """Stream every fetched per-country file into two combined guides:
+    the full merge and a window-trimmed one."""
+    now = datetime.now(timezone.utc)
+    win_start = now - timedelta(hours=LOOKBACK_HOURS)
+    win_end = now + timedelta(hours=WINDOW_HOURS)
+
+    full_path = os.path.join(OUT_DIR, "all.xml.gz")
+    trim_path = os.path.join(OUT_DIR, "all_48h.xml.gz")
+
+    header = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<tv generator-info-name="mainstreams-epg" '
+        'generator-info-url="https://github.com/mrjuse/mainstreams-epg">\n'
     )
+
     seen_channel_ids = set()
-    channel_count = 0
-    programme_count = 0
+    channels = 0
+    progs_full = 0
+    progs_trim = 0
+    no_time = 0
     included = 0
 
-    for region, codes in REGIONS.items():
-        for code in codes:
-            src = os.path.join(OUT_DIR, region, f"{code}.xml.gz")
-            if not os.path.exists(src):
-                continue  # that source failed to fetch this run
-            try:
-                with gzip.open(src, "rb") as f:
-                    src_root = ET.fromstring(f.read())
-            except Exception as e:  # noqa: BLE001
-                print(f"  WARN: skipping {src} in merge ({e})")
-                continue
-            included += 1
-            for chan in src_root.findall("channel"):
-                cid = chan.get("id")
-                if cid and cid in seen_channel_ids:
-                    continue
-                if cid:
-                    seen_channel_ids.add(cid)
-                root.append(chan)
-                channel_count += 1
-            for prog in src_root.findall("programme"):
-                root.append(prog)
-                programme_count += 1
+    with gzip.open(full_path, "wt", encoding="utf-8", compresslevel=6) as full, \
+         gzip.open(trim_path, "wt", encoding="utf-8", compresslevel=6) as trim:
+        full.write(header)
+        trim.write(header)
 
-    tree = ET.ElementTree(root)
-    buf = io.BytesIO()
-    tree.write(buf, encoding="utf-8", xml_declaration=True)
-    uncompressed = buf.getvalue()
+        for region, codes in REGIONS.items():
+            for code in codes:
+                src = os.path.join(OUT_DIR, region, f"{code}.xml.gz")
+                if not os.path.exists(src):
+                    continue  # that source failed to fetch this run
+                try:
+                    with gzip.open(src, "rb") as f:
+                        context = ET.iterparse(f, events=("start", "end"))
+                        _, root = next(context)
+                        for event, elem in context:
+                            if event != "end" or elem.tag not in ("channel", "programme"):
+                                continue
+                            elem.tail = None
+                            if elem.tag == "channel":
+                                cid = elem.get("id")
+                                if cid and cid in seen_channel_ids:
+                                    elem.clear()
+                                    root.clear()
+                                    continue
+                                if cid:
+                                    seen_channel_ids.add(cid)
+                                xml = ET.tostring(elem, encoding="unicode")
+                                full.write(xml)
+                                full.write("\n")
+                                trim.write(xml)
+                                trim.write("\n")
+                                channels += 1
+                            else:
+                                xml = ET.tostring(elem, encoding="unicode")
+                                full.write(xml)
+                                full.write("\n")
+                                progs_full += 1
+                                if parse_xmltv_time(elem.get("start")) is None:
+                                    no_time += 1
+                                elif in_window(elem, win_start, win_end):
+                                    trim.write(xml)
+                                    trim.write("\n")
+                                    progs_trim += 1
+                            elem.clear()
+                            root.clear()
+                    included += 1
+                except Exception as e:  # noqa: BLE001
+                    print(f"  WARN: problem reading {src} during merge ({e})")
 
-    out_path = os.path.join(OUT_DIR, "all.xml.gz")
-    with gzip.open(out_path, "wb", compresslevel=6) as gz:
-        gz.write(uncompressed)
+        full.write("</tv>\n")
+        trim.write("</tv>\n")
 
-    compressed_size = os.path.getsize(out_path)
+    full_size = os.path.getsize(full_path)
+    trim_size = os.path.getsize(trim_path)
+    pct = (100.0 * progs_trim / progs_full) if progs_full else 0.0
+
     print(
-        f"Merged {included} sources into all.xml.gz: "
-        f"{channel_count} channels, {programme_count} programmes, "
-        f"{human_size(len(uncompressed))} uncompressed / "
-        f"{human_size(compressed_size)} gzip"
+        f"Merged {included} sources: {channels} channels, "
+        f"{progs_full} programmes total"
     )
-    return compressed_size
+    if no_time:
+        print(f"  ({no_time} programmes had no parseable start time)")
+    print(f"  all.xml.gz     -> {human_size(full_size)} gzip (all programmes)")
+    print(
+        f"  all_48h.xml.gz -> {human_size(trim_size)} gzip "
+        f"({progs_trim} programmes, {pct:.1f}% of total, "
+        f"-{LOOKBACK_HOURS}h/+{WINDOW_HOURS}h window)"
+    )
+    return full_size, trim_size
 
 
-def write_index(results, combined_size=None):
+def write_index(results, full_size=None, trim_size=None):
     by_region = {}
     for region, code, name, size, ok, err in results:
         by_region.setdefault(region, []).append((code, name, size, ok, err))
@@ -247,7 +344,11 @@ def write_index(results, combined_size=None):
         "a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}",
         ".fail{color:#b42318}",
         ".meta{color:#666;font-size:.9rem}",
-        ".combined{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:1rem;margin-top:1.5rem}",
+        ".combined{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;",
+        "padding:1rem 1.25rem;margin-top:1.5rem}",
+        ".combined h3{margin:0 0 .5rem}",
+        ".combined p{margin:.5rem 0}",
+        ".rec{color:#1a7f37;font-weight:600}",
         "</style></head><body>",
         "<h1>Mainstreams EPG</h1>",
         (
@@ -259,16 +360,25 @@ def write_index(results, combined_size=None):
         f"&middot; {human_size(total_size)} total</p>",
     ]
 
-    if combined_size is not None:
+    if full_size is not None:
+        html.append("<div class='combined'>")
+        html.append("<h3>Need every region in one file?</h3>")
         html.append(
-            "<div class='combined'><strong>Need everything in one file?</strong> "
-            "<a href='all.xml.gz'><code>all.xml.gz</code></a> "
-            f"({human_size(combined_size)}) merges every region above into a single "
-            "XMLTV guide &mdash; use this if your playlist mixes channels from "
-            "multiple countries and your player only accepts one EPG URL. "
-            "It's a much larger download than any single-country file, so prefer "
-            "the individual files above when you can.</div>"
+            "<p><a href='all_48h.xml.gz'><code>all_48h.xml.gz</code></a> "
+            f"({human_size(trim_size)}) <span class='rec'>&larr; recommended</span><br>"
+            "Every channel from every region, but only programmes airing in a "
+            f"rolling &minus;{LOOKBACK_HOURS}h/+{WINDOW_HOURS}h window. Use this "
+            "one if your playlist mixes countries &mdash; it is small enough to "
+            "parse comfortably on set-top boxes and TV sticks.</p>"
         )
+        html.append(
+            "<p><a href='all.xml.gz'><code>all.xml.gz</code></a> "
+            f"({human_size(full_size)})<br>"
+            "The same merge with the complete multi-day listings. Only worth it "
+            "if you genuinely need the full schedule depth and your device has "
+            "the memory for it.</p>"
+        )
+        html.append("</div>")
 
     for region in REGIONS:
         entries = sorted(by_region.get(region, []), key=lambda r: r[1])
@@ -321,10 +431,10 @@ def main():
     ok_count = sum(1 for r in results if r[4])
     print(f"\nDone: {ok_count}/{len(results)} sources fetched successfully.")
 
-    print("\nMerging into a single combined file...")
-    combined_size = merge_all()
+    print("\nMerging into combined files...")
+    full_size, trim_size = merge_all()
 
-    write_index(results, combined_size=combined_size)
+    write_index(results, full_size=full_size, trim_size=trim_size)
 
 
 if __name__ == "__main__":
