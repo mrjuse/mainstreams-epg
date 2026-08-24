@@ -11,10 +11,12 @@ Three kinds of output:
   Best choice when a playlist only covers a single country.
 * ``public/all.xml.gz``             - every source merged into one XMLTV file.
   For players that accept only one EPG URL, but very large.
-* ``public/all_48h.xml.gz``        - the same merge trimmed to programmes
+* ``public/all_recent.xml.gz``     - the same merge trimmed to programmes
   airing in a rolling window (see WINDOW_HOURS / LOOKBACK_HOURS). Same
-  channel list, a small fraction of the programmes - this is the one to use
-  on memory-constrained devices such as Android TV sticks.
+  channel list, far fewer programmes - this is the one to use on
+  memory-constrained devices such as Android TV sticks. The filename is
+  deliberately window-agnostic so the URL configured in a player stays
+  valid if the window is ever retuned.
 
 The merge streams element-by-element straight into the gzip writers, so peak
 memory stays low no matter how large the combined guide gets.
@@ -37,11 +39,17 @@ MAX_WORKERS = 8
 RETRIES = 2
 TIMEOUT = 60
 
-# Rolling window kept in the trimmed combined guide. The workflow regenerates
-# daily, so at worst (just before the next run) the trimmed file still holds
-# WINDOW_HOURS - 24 hours of forward listings.
-WINDOW_HOURS = 48
-LOOKBACK_HOURS = 6  # keeps just-finished programmes, absorbs device clock skew
+# Rolling window kept in the trimmed combined guide.
+#
+# IMPORTANT: the window is evaluated when this script RUNS, not when a device
+# downloads the file. Worst-case forward coverage, just before the next
+# rebuild, is WINDOW_HOURS minus the rebuild interval - so WINDOW_HOURS must
+# comfortably exceed how often the workflow runs, or the file goes stale
+# between builds. The workflow rebuilds every 6 hours, so 18h here guarantees
+# at least 12h of forward listings at any moment.
+WINDOW_HOURS = 18
+LOOKBACK_HOURS = 3  # keeps just-finished programmes, absorbs device clock skew
+REBUILD_INTERVAL_HOURS = 6  # keep in sync with the cron in the workflow file
 
 REGIONS = {
     "north_america": {
@@ -228,12 +236,19 @@ def in_window(prog, win_start, win_end):
 def merge_all():
     """Stream every fetched per-country file into two combined guides:
     the full merge and a window-trimmed one."""
+    if WINDOW_HOURS <= REBUILD_INTERVAL_HOURS:
+        print(
+            f"  WARNING: WINDOW_HOURS ({WINDOW_HOURS}) is not greater than the "
+            f"rebuild interval ({REBUILD_INTERVAL_HOURS}h). The trimmed guide "
+            f"will contain no forward listings just before the next rebuild."
+        )
+
     now = datetime.now(timezone.utc)
     win_start = now - timedelta(hours=LOOKBACK_HOURS)
     win_end = now + timedelta(hours=WINDOW_HOURS)
 
     full_path = os.path.join(OUT_DIR, "all.xml.gz")
-    trim_path = os.path.join(OUT_DIR, "all_48h.xml.gz")
+    trim_path = os.path.join(OUT_DIR, "all_recent.xml.gz")
 
     header = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -312,7 +327,7 @@ def merge_all():
         print(f"  ({no_time} programmes had no parseable start time)")
     print(f"  all.xml.gz     -> {human_size(full_size)} gzip (all programmes)")
     print(
-        f"  all_48h.xml.gz -> {human_size(trim_size)} gzip "
+        f"  all_recent.xml.gz -> {human_size(trim_size)} gzip "
         f"({progs_trim} programmes, {pct:.1f}% of total, "
         f"-{LOOKBACK_HOURS}h/+{WINDOW_HOURS}h window)"
     )
@@ -364,7 +379,7 @@ def write_index(results, full_size=None, trim_size=None):
         html.append("<div class='combined'>")
         html.append("<h3>Need every region in one file?</h3>")
         html.append(
-            "<p><a href='all_48h.xml.gz'><code>all_48h.xml.gz</code></a> "
+            "<p><a href='all_recent.xml.gz'><code>all_recent.xml.gz</code></a> "
             f"({human_size(trim_size)}) <span class='rec'>&larr; recommended</span><br>"
             "Every channel from every region, but only programmes airing in a "
             f"rolling &minus;{LOOKBACK_HOURS}h/+{WINDOW_HOURS}h window. Use this "
